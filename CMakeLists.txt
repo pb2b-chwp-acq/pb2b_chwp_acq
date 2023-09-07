@@ -1,1 +1,0 @@
-execute_process(COMMAND ln -fsn ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/chwp)
