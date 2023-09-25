@@ -33,6 +33,9 @@ parser.add_argument(
 parser.add_argument(
     '--out_file', type=str, help='Save data to output file with this path',
     default=None)
+parser.add_argument(
+    '--port', type=int, help='Port to collect packets from',
+    default=8080)
 args = parser.parse_args()
 
 # ***** MAIN *****
@@ -41,11 +44,11 @@ pipe = core.G3Pipeline()
 # Add module to generate dummy MUX data
 pipe.Add(timed_read, start_time=time.time(), time_len=args.time)
 # Start the collection of packets from the CHWP MCU
-chwp_collector = chwp.CHWPCollector()
+chwp_collector = chwp.CHWPCollector(mcu_port=args.port)
 # Insert CHWP data into dummy MUX frames in the pipeline
 pipe.Add(chwp.CHWPBuilder, collector=chwp_collector)
 # Send CHWP data out for slow DAQ publishing
-pipe.Add(chwp.CHWPSlowDAQTee)
+#pipe.Add(chwp.CHWPSlowDAQTee)
 # Write data to a G3 file
 if args.out_file is not None:
     pipe.Add(core.G3Writer, filename=args.out_file)
