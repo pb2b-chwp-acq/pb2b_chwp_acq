@@ -1,6 +1,7 @@
 from spt3g import core  # pylint: disable=import-error
 from spt3g import chwp # pylint: disable=import-error
 import time
+import os
 import argparse
 from datetime import datetime
 
@@ -8,7 +9,7 @@ from datetime import datetime
 # generate bolometer timepoint frames artificially
 num_frames = 0
 
-db_path = ''
+db_path = '/data2/home/polarbear/bbixler/pb2b_chwp_acq/data'
 
 def timed_read(frame, start_time, time_len, samp_rate=10):
     global num_frames
@@ -33,12 +34,12 @@ def timed_read(frame, start_time, time_len, samp_rate=10):
 
 
 def add_datetime(frame):
-    if (frame.type == core.G3FrmaeType.Timepoint and
-            ('chwp_encoder_clock' in frame.keys() or
-            'chwp_irig_clock' in frame.keys())):
-        now = datetime.utcnow()
-        frame['frame_day'] = now.strftime("%Y%m%d")
-        frame['frame_time'] = now.strftime("%Y%m%d%H%M%S")
+    #if (frame.type == core.G3FrameType.Timepoint and
+    #        ('chwp_encoder_clock' in frame.keys() or
+    #        'chwp_irig_clock' in frame.keys())):
+    now = datetime.utcnow()
+    frame['frame_day'] = now.strftime("%Y%m%d")
+    frame['frame_time'] = now.strftime("%Y%m%d%H%M%S")
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser()
@@ -64,9 +65,8 @@ pipe.Add(chwp.CHWPBuilder, collector=chwp_collector)
 
 pipe.Add(add_datetime)
 # Write data to a G3 file
-if args.out_file is not None:
-    pipe.Add(core.G3MultiFileWriter, filename=lambda fr: os.path.join(db_path,fr['frame_day'],fr['frame_time']),
-             size_limit=2**20)
+pipe.Add(core.G3MultiFileWriter, filename=lambda fr, _: os.path.join(db_path,fr['frame_day'],fr['frame_time']+'.g3'),
+         size_limit=2**25)
 
 # Run the pipeline
 pipe.Run(profile=True)
