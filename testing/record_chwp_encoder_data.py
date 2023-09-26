@@ -39,7 +39,7 @@ def add_datetime(frame):
     #        'chwp_irig_clock' in frame.keys())):
     now = datetime.utcnow()
     frame['frame_day'] = now.strftime("%Y%m%d")
-    frame['frame_time'] = now.strftime("%Y%m%d%H%M%S")
+    frame['frame_time'] = now.strftime("%Y%m%d_%H%M%S")
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser()
