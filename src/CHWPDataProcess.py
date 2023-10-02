@@ -1,5 +1,6 @@
 import numpy as np
 import scipy.optimize as opt
+import scipy.ndimage as ndi
 from collections import deque
 from spt3g import core  #pylint: disable=import-error
 import os
@@ -17,6 +18,7 @@ class CHWPDataProcess(object):
         self._delta_angle = 2 * np.pi / self._num_edges
         self._ref_edges = 2
         self._edges_per_rev = self._num_edges - self._ref_edges
+        self._filter_weights = np.full(self._edges_per_rev, 1/self._edges_per_rev)
         # Allowed jitter in slit width
         self._dev = 0.1  # 10%
         # Information about the bits that are saved
@@ -73,6 +75,8 @@ class CHWPDataProcess(object):
         self._find_refs()
         # "Fill" in these reference slits
         self._fill_refs()
+        # Identifies and removes glitches
+        self._fix_glitches()
         # Find any dropped packets
         self._find_dropped_packets()
         # Store the clock and count
@@ -89,12 +93,19 @@ class CHWPDataProcess(object):
         self._calc_angle_linear()
         return
 
+    def _flatten_counter(self):
+        cnt_diff = np.diff(self._encd_cnt)
+        loop_indexes = np.argwhere(cnt_diff <= -(self._max_cnt-1)).flatten()
+        for ind in loop_indexes:
+            self._encd_cnt[(ind+1):] += -(cnt_diff[ind]-1)
+        return
+
     def _find_refs(self):
         """ Find reference slits """
         # Calculate spacing between all clock values
-        diff = np.ediff1d(self._encd_clk, to_begin=0)
+        self._encd_diff = np.ediff1d(self._encd_clk, to_begin=2*self._encd_clk[0]-self._encd_clk[1])
         # Define median value as nominal slit distance
-        self._slit_dist = np.median(diff)
+        self._slit_dist = ndi.convolve(self._encd_diff, self._filter_weights, mode='reflect')
         # Conditions for idenfitying the ref slit
         # Slit distance somewhere between 2 slits:
         # 2 slit distances (defined above) +/- 10%
@@ -104,8 +115,8 @@ class CHWPDataProcess(object):
             self._slit_dist * (1 - self._dev))
         # Find the reference slit locations (indexes)
         self._ref_indexes = np.argwhere(np.logical_and(
-            diff < ref_hi_cond,
-            diff > ref_lo_cond)).flatten()
+            self._encd_diff < ref_hi_cond,
+            self._encd_diff > ref_lo_cond)).flatten()
         # Define the reference slit line to be the line before
         # the two "missing" lines
         # Store the count and clock values of the reference lines
@@ -113,7 +124,7 @@ class CHWPDataProcess(object):
         self._ref_cnt = np.take(self._encd_cnt, self._ref_indexes)
         return
 
-    def _fill_refs(self):
+    def _fill_refs(self, interp=False):
         """ Fill in the reference edges """
         # If no references, say that the first sample is theta = 0
         # This case comes up for testing with a function generator
@@ -125,33 +136,117 @@ class CHWPDataProcess(object):
         for ii in range(len(self._ref_indexes)):
             # Location of this slit
             ref_index = self._ref_indexes[ii]
-            # Linearly interpolate the missing slits
-            clks_to_add = np.linspace(
-                self._encd_clk[ref_index-1], self._encd_clk[ref_index],
-                self._ref_edges + 2)[1:-1]
-            self._encd_clk = np.insert(self._encd_clk, ref_index, clks_to_add)
-            # Adjust the encoder count values for the added lines
-            # Add 2 to all future counts and interpolate the counts
-            # for the two added slits
-            self._encd_cnt[ref_index:] += self._ref_edges
-            cnts_to_add = np.linspace(
-                self._encd_cnt[ref_index-1], self._encd_cnt[ref_index],
-                self._ref_edges + 2)[1:-1]
-            self._encd_cnt = np.insert(self._encd_cnt, ref_index, cnts_to_add)
-            # Also adjsut the reference count values in front of
-            # this one for the added lines
-            self._ref_cnt[ref_index:] += self._ref_edges
-            # Adjust the reference index values in front of this one
-            # for the added lines
-            self._ref_indexes[ii+1:] += self._ref_edges
+            if interp:
+                # Linearly interpolate the missing slits
+                clks_to_add = np.linspace(
+                    self._encd_clk[ref_index-1], self._encd_clk[ref_index],
+                    self._ref_edges + 2)[1:-1]
+                self._encd_clk = np.insert(self._encd_clk, ref_index, clks_to_add)
+                # Adjust the encoder count values for the added lines
+                # Add 2 to all future counts and interpolate the counts
+                # for the two added slits
+                self._encd_cnt[ref_index:] += self._ref_edges
+                cnts_to_add = np.linspace(
+                    self._encd_cnt[ref_index-1], self._encd_cnt[ref_index],
+                    self._ref_edges + 2)[1:-1]
+                self._encd_cnt = np.insert(self._encd_cnt, ref_index, cnts_to_add)
+                # Also adjsut the reference count values in front of
+                # this one for the added lines
+                self._ref_cnt[ii+1:] += self._ref_edges
+                # Adjust the reference index values in front of this one
+                # for the added lines
+                self._ref_indexes[ii+1:] += self._ref_edges
+            else:
+                self._encd_cnt[ref_index:] += self._ref_edges
+                self._ref_cnt[ii+1:] += self._ref_edges
         return
 
-    def _flatten_counter(self):
-        cnt_diff = np.diff(self._encd_cnt)
-        loop_indexes = np.argwhere(cnt_diff <= -(self._max_cnt-1)).flatten()
-        for ind in loop_indexes:
-            self._encd_cnt[(ind+1):] += -(cnt_diff[ind]-1)
-        return
+    def _fix_glitches(self):
+		def find_rot_start_type(diffs, high, low, loop=True):
+			diff_sum = 0
+			prev_res = {'value': 2**30}
+			for ii, diff in enumerate(diffs[1:]):
+				diff_sum += diff
+				res_high = abs(high-diff_sum)
+				res_low = abs(low-diff_sum)
+
+				if prev_res['value'] < min(res_high, res_low):
+					if prev_res['count'] < 10:
+						prev_res['count'] += 1
+					else:
+						if loop:
+							next_res = find_rot_start_type(diffs[1+prev_res['index']:], 
+														   high, low, loop=False)
+							if next_res['type'] != prev_res['type']:
+								return True, prev_res['type']
+							else:
+								print('Warning: Could not determine duty cycle')
+								return False, 'error'
+						else:
+							return prev_res
+
+				else:
+					prev_res = {'value': min(res_high, res_low),
+								'type': 'high' if res_high < res_low else 'low',
+								'count': 0,
+								'index': ii}
+
+			print('Warning: Unexpected glitch type')
+			return False, 'error'
+
+		def glitch_mask(diffs, high, low, start):
+			return_mask = []
+			toggle = not start
+			diff_sum = 0
+			prev_res = 0
+			for ii, diff in enumerate(diffs[1:]):
+				diff_sum += diff
+				res = abs(high-diff_sum) if toggle else abs(low-diff_sum)
+
+				if prev_res < res:
+					return_mask.append(True)
+					diff_sum = diff
+					toggle = not toggle
+					res = abs(high-diff_sum) if toggle else abs(low-diff_sum)
+				else:
+					return_mask.append(False)
+
+				prev_res = res
+			else:
+				return_mask.append(True)
+
+			if np.sum(return_mask) == self._edges_per_rev:
+				return return_mask
+			else:
+				print('Warning: Could not remove glitches from rotation')
+				return return_mask*False
+
+		glitched_rots = np.ediff1d(self._ref_cnt, to_end=self._ref_cnt[-1]+self._num_edges) \
+				!= self._num_edges
+		for ii, ref_ind in enumerate(self._ref_indexes):
+			if glitched_rots[ii]:
+				rot_encd_clk = self._encd_clk[ref_ind:self._ref_indexes[ii+1]]
+				rot_encd_diff = self._encd_diff[ref_ind:self._ref_indexes[ii+1]]
+				rot_slit_dist = self._slit_dist[ref_ind:self._ref_indexes[ii+1]]
+
+				ref_high_med = np.median(rot_encd_diff[np.where(rot_encd_diff > rot_slit_dist)])
+				ref_low_med = np.median(rot_encd_diff[np.where(rot_encd_diff < rot_slit_dist)])
+
+				response, start_type = find_rot_start_type(rot_encd_diff, ref_high_med, ref_low_med)
+
+				if not response:
+					rot_mask = np.full(len(rot_encd_diff), False)
+				else:
+					rot_mask = glitch_mask(rot_encd_diff, ref_high_med, ref_low_med, start_type)
+
+				num_glitches = len(rot_mask) - np.sum(rot_mask)
+				if num_glitches == 0:
+					continue
+
+				self._ref_indexes[ii+1:] -= num_glitches
+				self._encd_clk[ref_ind:ref_indexes[ii+1]] = \
+						rot_encd_clk[rot_mask]
+				self._encd_cnt[]
 
     def _find_dropped_packets(self):
         """ Estimate the number of dropped packets """
