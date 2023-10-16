@@ -198,7 +198,7 @@ class CHWPDataProcess(object):
 
 		def glitch_mask(diffs, high, low, start):
 			return_mask = []
-			toggle = start
+			toggle = not start
 			diff_sum = 0
 			prev_res = 0
 			for diff in diffs:
