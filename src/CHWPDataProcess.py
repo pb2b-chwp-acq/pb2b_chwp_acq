@@ -10,7 +10,7 @@ import sys
 class CHWPDataProcess(object):
     def __init__(self, edge_scalar=1140):
         # Size of pakcets sent from the BBB
-        self._pkt_size = 150
+        self._pkt_size = 120
         # Maximum counter value from the BBB
         self._max_cnt = 0x5FFFFFFF
         # Number of encoder slits per HWP revolution
@@ -60,7 +60,6 @@ class CHWPDataProcess(object):
             out_frame = core.G3Frame(core.G3FrameType.Timepoint)
             out_frame['chwp_encoder_quad'] = core.G3VectorUInt(self._encd_quad)
             out_frame['chwp_encoder_clock'] = core.G3VectorUInt(self._encd_clk)
-            out_frame['chwp_encoder_count'] = core.G3VectorUInt(self._encd_cnt)
             out_frame['chwp_irig_clock'] = core.G3VectorUInt(self._irig_clk)
             out_frame['chwp_irig_time'] = core.G3VectorUInt(self._irig_tme)
             out_frame['chwp_time'] = core.G3VectorDouble(self._time)
@@ -69,8 +68,6 @@ class CHWPDataProcess(object):
             return [out_frame, core.G3Frame(core.G3FrameType.EndProcessing)]
 
     def _angle_time(self):
-        # Account for counter overflows
-        self._flatten_counter()
         # Identify the reference slits
         self._find_refs()
         # "Fill" in these reference slits
@@ -79,31 +76,22 @@ class CHWPDataProcess(object):
         self._fix_glitches()
         # Find any dropped packets
         self._find_dropped_packets()
-        # Store the clock and count
+        # Store the clock
         self._clock = self._encd_clk
-        self._count = self._encd_cnt
         # Toss any encoder lines before the first IRIG clock value
         self._begin_trunc = len(self._encd_clk[self._encd_clk < self._irig_clk[0]])
         self._end_trunc = len(self._encd_clk[self._encd_clk > self._irig_clk[-1]]) + 1
         self._encd_clk = self._encd_clk[self._begin_trunc:-self._end_trunc]
-        self._encd_cnt = self._encd_cnt[self._begin_trunc:-self._end_trunc]
         # Find the time
         self._time = np.interp(self._encd_clk, self._irig_clk, self._irig_tme)
         # Find the angle
         self._calc_angle_linear()
         return
 
-    def _flatten_counter(self):
-        cnt_diff = np.diff(self._encd_cnt)
-        loop_indexes = np.argwhere(cnt_diff <= -(self._max_cnt-1)).flatten()
-        for ind in loop_indexes:
-            self._encd_cnt[(ind+1):] += -(cnt_diff[ind]-1)
-        return
-
     def _find_refs(self):
         """ Find reference slits """
         # Calculate spacing between all clock values
-        self._encd_diff = np.ediff1d(self._encd_clk, to_begin=2*self._encd_clk[0]-self._encd_clk[1])
+        self._encd_diff = np.ediff1d(self._encd_clk, to_begin=self._encd_clk[0]-self._encd_clk[1])
         # Define median value as nominal slit distance
         self._slit_dist = ndi.convolve(self._encd_diff, self._filter_weights, mode='reflect')
         # Conditions for idenfitying the ref slit
@@ -121,44 +109,59 @@ class CHWPDataProcess(object):
         # the two "missing" lines
         # Store the count and clock values of the reference lines
         self._ref_clk = np.take(self._encd_clk, self._ref_indexes)
-        self._ref_cnt = np.take(self._encd_cnt, self._ref_indexes)
         return
 
-    def _fill_refs(self, interp=False):
+    def _fill_refs(self):
         """ Fill in the reference edges """
         # If no references, say that the first sample is theta = 0
         # This case comes up for testing with a function generator
         if len(self._ref_clk) == 0:
             self._ref_clk = [self._encd_clk[0]]
-            self._ref_cnt = [self._encd_cnt[0]]
             return
         # Loop over all of the reference slits
         for ii in range(len(self._ref_indexes)):
             # Location of this slit
             ref_index = self._ref_indexes[ii]
-            if interp:
-                # Linearly interpolate the missing slits
-                clks_to_add = np.linspace(
-                    self._encd_clk[ref_index-1], self._encd_clk[ref_index],
-                    self._ref_edges + 2)[1:-1]
-                self._encd_clk = np.insert(self._encd_clk, ref_index, clks_to_add)
-                # Adjust the encoder count values for the added lines
-                # Add 2 to all future counts and interpolate the counts
-                # for the two added slits
-                self._encd_cnt[ref_index:] += self._ref_edges
-                cnts_to_add = np.linspace(
-                    self._encd_cnt[ref_index-1], self._encd_cnt[ref_index],
-                    self._ref_edges + 2)[1:-1]
-                self._encd_cnt = np.insert(self._encd_cnt, ref_index, cnts_to_add)
-                # Also adjsut the reference count values in front of
-                # this one for the added lines
-                self._ref_cnt[ii+1:] += self._ref_edges
-                # Adjust the reference index values in front of this one
-                # for the added lines
-                self._ref_indexes[ii+1:] += self._ref_edges
-            else:
-                self._encd_cnt[ref_index:] += self._ref_edges
-                self._ref_cnt[ii+1:] += self._ref_edges
+			
+            # Interpolate the missing slits
+			try:
+				rot_encd_diff = self._encd_diff[ref_index, self._ref_indexes[ii+1]]
+				rot_slit_dist = self._slit_dist[ref_index, self._ref_indexes[ii+1]]
+			except IndexError:
+				rot_encd_diff = self._encd_diff[self._ref_indexes[ii-1], ref_index]
+				rot_slit_dist = self._slit_dist[self._ref_indexes[ii-1], ref_index]
+
+			high = np.median(rot_encd_diff[np.where(rot_encd_diff > rot_slit_dist)])
+			low = np.median(rot_encd_diff[np.where(rot_encd_diff < rot_slit_dist)])
+
+            clks_to_add = np.linspace(
+                self._encd_clk[ref_index-1], self._encd_clk[ref_index],
+                self._ref_edges + 2)
+
+			res_high = abs(clks_to_add[-1] - clks_to_add[0] - 2*high - low)
+			res_low = abs(clks_to_add[-1] - clks_to_add[0] - high - 2*low)
+
+			first = high if res_high < res_low else low
+			second = low if res_high < res_low else high
+
+			ratio1 = first/(2*first + second)
+			ratio2 = (first + second)/(2*first + second)
+
+			clks_to_add[1] = clks_to_add[0] + (clks_to_add[3]-clks_to_add[0])*ratio1
+			clks_to_add[2] = clks_to_add[0] + (clks_to_add[3]-clks_to_add[0])*ratio2
+            self._encd_clk = np.insert(self._encd_clk, ref_index, clks_to_add[1:-1])
+
+			# Adjust the clock difference array
+			diffs_to_add = np.diff(clks_to_add)
+			self._encd_diff = np.insert(np.delete(self._encd_diff, ref_index), 
+										ref_index, diffs_to_add)
+
+			# Adjust the slit distance array
+			dists_to_add = np.ones(2)*(first+second)/2
+			self._slit_dist = np.insert(self._slit_dist, ref_index, dists_to_add)
+            # Adjust the reference index values in front of this one
+            # for the added lines
+            self._ref_indexes[ii+1:] += self._ref_edges
         return
 
     def _fix_glitches(self):
@@ -184,7 +187,6 @@ class CHWPDataProcess(object):
 								return False, 'error'
 						else:
 							return prev_res
-
 				else:
 					prev_res = {'value': min(res_high, res_low),
 								'type': 'high' if res_high < res_low else 'low',
@@ -196,10 +198,10 @@ class CHWPDataProcess(object):
 
 		def glitch_mask(diffs, high, low, start):
 			return_mask = []
-			toggle = not start
+			toggle = start
 			diff_sum = 0
 			prev_res = 0
-			for ii, diff in enumerate(diffs[1:]):
+			for diff in diffs:
 				diff_sum += diff
 				res = abs(high-diff_sum) if toggle else abs(low-diff_sum)
 
@@ -214,47 +216,63 @@ class CHWPDataProcess(object):
 				prev_res = res
 			else:
 				return_mask.append(True)
+				return_mask = return_mask[1:]
 
-			if np.sum(return_mask) == self._edges_per_rev:
-				return return_mask
+			if np.sum(return_mask) == self._num_edges:
+				return True, return_mask
 			else:
 				print('Warning: Could not remove glitches from rotation')
-				return return_mask*False
+				return False, np.full(len(return_mask), False)
 
-		glitched_rots = np.ediff1d(self._ref_cnt, to_end=self._ref_cnt[-1]+self._num_edges) \
+		glitched_rots = np.ediff1d(self._ref_indexes, to_end=self._num_edges) \
 				!= self._num_edges
+		dead_rots = []
 		for ii, ref_ind in enumerate(self._ref_indexes):
 			if glitched_rots[ii]:
 				rot_encd_clk = self._encd_clk[ref_ind:self._ref_indexes[ii+1]]
 				rot_encd_diff = self._encd_diff[ref_ind:self._ref_indexes[ii+1]]
 				rot_slit_dist = self._slit_dist[ref_ind:self._ref_indexes[ii+1]]
 
-				ref_high_med = np.median(rot_encd_diff[np.where(rot_encd_diff > rot_slit_dist)])
-				ref_low_med = np.median(rot_encd_diff[np.where(rot_encd_diff < rot_slit_dist)])
+				high = np.median(rot_encd_diff[np.where(rot_encd_diff > rot_slit_dist)])
+				low = np.median(rot_encd_diff[np.where(rot_encd_diff < rot_slit_dist)])
 
-				response, start_type = find_rot_start_type(rot_encd_diff, ref_high_med, ref_low_med)
+				resp1, start_type = find_rot_start_type(rot_encd_diff, high, low)
 
-				if not response:
+				if not resp1:
 					rot_mask = np.full(len(rot_encd_diff), False)
+					dead_rots.append(ii)
 				else:
-					rot_mask = glitch_mask(rot_encd_diff, ref_high_med, ref_low_med, start_type)
+					resp2, rot_mask = glitch_mask(rot_encd_diff, high, low, start_type)
+					if not resp2:
+						dead_rots.append(ii)
 
 				num_glitches = len(rot_mask) - np.sum(rot_mask)
 				if num_glitches == 0:
 					continue
 
-				self._ref_indexes[ii+1:] -= num_glitches
-				self._encd_clk[ref_ind:ref_indexes[ii+1]] = \
+				self._encd_clk = np.delete(self._encd_clk, ref_ind + np.arange(num_glitches))
+				self._encd_clk[ref_ind:ref_ind + np.sum(rot_mask)] = \
 						rot_encd_clk[rot_mask]
-				self._encd_cnt[]
+				self._encd_diff = np.delete(self._encd_diff, ref_ind + np.arange(num_glitches))
+				self._encd_diff[ref_ind:ref_ind + np.sum(rot_mask)] = \
+						np.ediff1d(rot_encd_clk[rot_mask], to_begin=rot_encd_diff[0])
+				self._ref_indexes[ii+1:] -= num_glitches
+		
+		self._ref_indexes = np.delete(self._ref_indexes, dead_rots)
 
     def _find_dropped_packets(self):
         """ Estimate the number of dropped packets """
-        cnt_diff = np.diff(self._encd_cnt)
+        # Needs to be fixed
+		cnt_diff = np.diff(self._encd_cnt)
         dropped_samples = np.sum(cnt_diff[cnt_diff >= self._pkt_size])
         self._num_dropped_pkts = dropped_samples // (self._pkt_size - 1)
         return
-    
+
     def _calc_angle_linear(self):
-        self._angle = (self._encd_cnt - self._ref_cnt[0]) * self._delta_angle
+		# Needs to be fixed
+		self._angle = np.zeros(len(self._encd_clk))
+		for ii, ref_ind in enumerate(self._ref_indexes):
+			pass
+
+		self._angle = (self._encd_cnt - self._ref_cnt[0]) * self._delta_angle
         return
