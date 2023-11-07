@@ -68,6 +68,8 @@ class CHWPDataProcess(object):
             return [out_frame, core.G3Frame(core.G3FrameType.EndProcessing)]
 
     def _angle_time(self):
+		# Account for counter overflows
+		self._flatten_counter()
         # Identify the reference slits
         self._find_refs()
         # "Fill" in these reference slits
@@ -82,10 +84,9 @@ class CHWPDataProcess(object):
         self._begin_trunc = len(self._encd_clk[self._encd_clk < self._irig_clk[0]])
         self._end_trunc = len(self._encd_clk[self._encd_clk > self._irig_clk[-1]]) + 1
         self._encd_clk = self._encd_clk[self._begin_trunc:-self._end_trunc]
+		self._angle = self._angle[self._begin_trunc:-self._end_trunc]
         # Find the time
         self._time = np.interp(self._encd_clk, self._irig_clk, self._irig_tme)
-        # Find the angle
-        self._calc_angle_linear()
         return
 
     def _find_refs(self):
@@ -224,20 +225,32 @@ class CHWPDataProcess(object):
 				print('Warning: Could not remove glitches from rotation')
 				return False, np.full(len(return_mask), False)
 
+		def generate_angles(high, low, start):
+			duty_cor = np.array([0,(1 if start == 'high' else -1)*(high-low)/(high+low)])
+			angle = np.arange(self._num_edges).reshape(int(self._num_edges/2),2)
+			angle = self._delta_angle*(angle + duty_cor).flatten()
+			return angle
+
 		glitched_rots = np.ediff1d(self._ref_indexes, to_end=self._num_edges) \
 				!= self._num_edges
 		dead_rots = []
+		self._angle = np.zeros(len(self._encd_clk))
 		for ii, ref_ind in enumerate(self._ref_indexes):
-			if glitched_rots[ii]:
+			if ref_ind == self._ref_indexes[-1]:
+				rot_encd_clk = self._encd_clk[ref_ind:]
+				rot_encd_diff = self._encd_diff[ref_ind:]
+				rot_slit_dist = self._slit_dist[ref_ind:]
+			else:
 				rot_encd_clk = self._encd_clk[ref_ind:self._ref_indexes[ii+1]]
 				rot_encd_diff = self._encd_diff[ref_ind:self._ref_indexes[ii+1]]
 				rot_slit_dist = self._slit_dist[ref_ind:self._ref_indexes[ii+1]]
 
-				high = np.median(rot_encd_diff[np.where(rot_encd_diff > rot_slit_dist)])
-				low = np.median(rot_encd_diff[np.where(rot_encd_diff < rot_slit_dist)])
+			high = np.median(rot_encd_diff[np.where(rot_encd_diff > rot_slit_dist)])
+			low = np.median(rot_encd_diff[np.where(rot_encd_diff < rot_slit_dist)])
 
-				resp1, start_type = find_rot_start_type(rot_encd_diff, high, low)
+			resp1, start_type = find_rot_start_type(rot_encd_diff, high, low)
 
+			if glitched_rots[ii]:
 				if not resp1:
 					rot_mask = np.full(len(rot_encd_diff), False)
 					dead_rots.append(ii)
@@ -253,16 +266,32 @@ class CHWPDataProcess(object):
 				self._encd_clk = np.delete(self._encd_clk, ref_ind + np.arange(num_glitches))
 				self._encd_clk[ref_ind:ref_ind + np.sum(rot_mask)] = \
 						rot_encd_clk[rot_mask]
+
 				self._encd_diff = np.delete(self._encd_diff, ref_ind + np.arange(num_glitches))
 				self._encd_diff[ref_ind:ref_ind + np.sum(rot_mask)] = \
 						np.ediff1d(rot_encd_clk[rot_mask], to_begin=rot_encd_diff[0])
+
+				temp_angle = generate_angles(high, low, start_type)
+				self._angle = np.delete(self._angle, ref_ind + np.arange(num_glitches))
+				self._angle[ref_ind:ref_ind + np.sum(rot_mask)] = temp_angle
+
 				self._ref_indexes[ii+1:] -= num_glitches
+			else:
+				temp_angle = generate_angles(high, low, start_type)
+				self._angle[ref_ind:ref_ind + self._num_edges] = temp_angle
 		
+        self._slit_dist = ndi.convolve(self._encd_diff, self._filter_weights, mode='reflect')
 		self._ref_indexes = np.delete(self._ref_indexes, dead_rots)
+
+	def _flatten_counter(self):
+		cnt_diff = np.diff(self._encd_cnt)
+		loop_indexes = np.argwhere(cnt_diff <= -(self._max_cnt-1)).flatten()
+		for ind in loop_indexes:
+			self._encd_cnt[(ind+1):] += -(cnt_diff[ind]-1)
+		return
 
     def _find_dropped_packets(self):
         """ Estimate the number of dropped packets """
-        # Needs to be fixed
 		cnt_diff = np.diff(self._encd_cnt)
         dropped_samples = np.sum(cnt_diff[cnt_diff >= self._pkt_size])
         self._num_dropped_pkts = dropped_samples // (self._pkt_size - 1)
@@ -272,7 +301,11 @@ class CHWPDataProcess(object):
 		# Needs to be fixed
 		self._angle = np.zeros(len(self._encd_clk))
 		for ii, ref_ind in enumerate(self._ref_indexes):
-			pass
+			rot_encd_diff = self._encd_diff[ref_ind:ref_ind+self._num_edges]
+			rot_slit_dist = self._slit_dist[ref_ind:ref_ind+self._num_edges]
+
+			high = np.median(rot_encd_diff[np.where(rot_encd_diff > rot_slit_dist)])
+			low = np.median(rot_encd_diff[np.where(rot_encd_diff < rot_slit_dist)])
 
 		self._angle = (self._encd_cnt - self._ref_cnt[0]) * self._delta_angle
         return
